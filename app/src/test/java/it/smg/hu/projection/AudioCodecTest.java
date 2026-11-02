@@ -141,13 +141,25 @@ public class AudioCodecTest {
         codec.start();
 
         codec.write(filled(40, 1), 0);
-        Thread.sleep(100);
+        Thread.sleep(30);
         assertEquals("sink started before enough audio was buffered", 0, sink.played.get());
         assertEquals(0, sink.writeCount());
 
         codec.write(filled(60, 2), 0);
         assertTrue(sink.awaitBytes(100, 2000));
         assertEquals(1, sink.played.get());
+        codec.stop();
+    }
+
+    @Test
+    public void shortAudioStillPlaysWhenPrebufferIsNeverReached() throws Exception {
+        FakeAudioSink sink = new FakeAudioSink();
+        AudioCodec codec = new AudioCodec("short-test-audio", () -> sink, 0, 1000);
+        codec.start();
+
+        codec.write(filled(10, 1), 0);
+
+        assertTrue(sink.awaitBytes(10, 2000));
         codec.stop();
     }
 

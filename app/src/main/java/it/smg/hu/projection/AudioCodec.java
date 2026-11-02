@@ -19,6 +19,7 @@ public class AudioCodec implements IAudioCodec, Runnable {
     private static final long IDLE_POLL_MS = 50;
     private static final int PACKET_POOL_SIZE = 64;
     private static final long PREBUFFER_POLL_MS = 5;
+    private static final long PREBUFFER_MAX_WAIT_MS = 100; // play anyway if the source is slow or short
     // how a bounded total delay is split: sink buffer + queue cap, with the prebuffer inside the queue part
     private static final int SINK_PERCENT = 60;
     private static final int QUEUE_PERCENT = 40;
@@ -52,29 +53,29 @@ public class AudioCodec implements IAudioCodec, Runnable {
     private Thread codecThread_;
 
     /** Legacy latency: small sink buffer, unbounded queue, immediate start. */
-    public AudioCodec(String name, int streamType, int sampleRate, int channelConfig, int sampleSize){
-        this(name, streamType, sampleRate, channelConfig, sampleSize, 0);
+    public AudioCodec(String name, int streamType, int sampleRate, int channelCount, int sampleSize){
+        this(name, streamType, sampleRate, channelCount, sampleSize, 0);
     }
 
     /**
      * @param totalDelayMs if > 0, sink buffer plus queue cap add up to about this delay and playback
      *                     starts once a small amount is buffered; if 0, today's latency is kept
      */
-    public AudioCodec(String name, int streamType, int sampleRate, int channelConfig, int sampleSize, int totalDelayMs){
+    public AudioCodec(String name, int streamType, int sampleRate, int channelCount, int sampleSize, int totalDelayMs){
         this(name, () -> {
-            int channels = channels2num(channelConfig);
+            int channels = channels2num(channelCount);
             int format = sampleSizeFromInt(sampleSize);
             int bufferSize = AudioTrack.getMinBufferSize(sampleRate, channels, format);
             if (totalDelayMs > 0) {
-                bufferSize = Math.max(bufferSize, bytesFor(sampleRate, channelConfig, sampleSize, totalDelayMs * SINK_PERCENT / 100));
+                bufferSize = Math.max(bufferSize, bytesFor(sampleRate, channelCount, sampleSize, totalDelayMs * SINK_PERCENT / 100));
             } else {
                 bufferSize *= 3;
             }
             if (Log.isInfo()) Log.i(TAG, "Buffer size " + bufferSize);
             return new AndroidAudioSink(streamType, sampleRate, channels, format, bufferSize);
         },
-        totalDelayMs > 0 ? bytesFor(sampleRate, channelConfig, sampleSize, totalDelayMs * QUEUE_PERCENT / 100) : 0,
-        totalDelayMs > 0 ? bytesFor(sampleRate, channelConfig, sampleSize, totalDelayMs * PREBUFFER_PERCENT / 100) : 0);
+        totalDelayMs > 0 ? bytesFor(sampleRate, channelCount, sampleSize, totalDelayMs * QUEUE_PERCENT / 100) : 0,
+        totalDelayMs > 0 ? bytesFor(sampleRate, channelCount, sampleSize, totalDelayMs * PREBUFFER_PERCENT / 100) : 0);
     }
 
     AudioCodec(String name, AudioSink.Factory sinkFactory){
@@ -85,7 +86,8 @@ public class AudioCodec implements IAudioCodec, Runnable {
         name_ = name;
         sinkFactory_ = sinkFactory;
         maxQueuedBytes_ = maxQueuedBytes;
-        prebufferBytes_ = prebufferBytes;
+        // a prebuffer above the cap could never be reached
+        prebufferBytes_ = maxQueuedBytes > 0 ? Math.min(prebufferBytes, maxQueuedBytes) : prebufferBytes;
         running_ = new AtomicBoolean(false);
 
         queue_ = new LinkedBlockingQueue<>();
@@ -138,7 +140,7 @@ public class AudioCodec implements IAudioCodec, Runnable {
 
         if (maxQueuedBytes_ > 0) {
             // drop the oldest audio so the newest is kept and the delay stays bounded
-            while (queuedBytes_.get() > maxQueuedBytes_) {
+            while (queuedBytes_.get() > maxQueuedBytes_ && queue_.size() > 1) {
                 Packet oldest = queue_.poll();
                 if (oldest == null) break;
                 queuedBytes_.addAndGet(-oldest.length);
@@ -199,10 +201,12 @@ public class AudioCodec implements IAudioCodec, Runnable {
         }
 
         // avoid an initial underrun: wait until a little audio is buffered before playing
-        while (running_.get() && queuedBytes_.get() < prebufferBytes_) {
+        long prebufferDeadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(PREBUFFER_MAX_WAIT_MS);
+        while (running_.get() && queuedBytes_.get() < prebufferBytes_ && System.nanoTime() < prebufferDeadline) {
             try {
                 Thread.sleep(PREBUFFER_POLL_MS);
             } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
                 break;
             }
         }
