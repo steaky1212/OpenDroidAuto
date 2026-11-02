@@ -33,3 +33,11 @@ The Audio channel carrying short system sounds such as notifications.
 **Smooth audio**:
 Audio with no audible stutter or dropout. This is how the owner judges audio quality, by ear on the head unit.
 _Avoid_: Good audio, low latency
+
+**Session**:
+One connection between the Phone and OPA, from start to stop.
+_Avoid_: Connection, run
+
+**Reconnect**:
+OPA automatically starting a new Session after a transient error, without closing the player screen.
+_Avoid_: Retry (as a noun for the outcome), restart

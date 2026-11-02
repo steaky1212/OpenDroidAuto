@@ -7,6 +7,7 @@ import android.os.Binder;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.view.SurfaceView;
 import android.widget.Toast;
 
@@ -52,7 +53,15 @@ public class ODAService extends Service implements IAndroidAutoEntityEventHandle
 
     private Handler mainHandler_;
 
-    private boolean isRunning_;
+    private volatile boolean isRunning_;
+
+    // Reconnect after a transient error: what the Start button used, so it can be repeated
+    private final ReconnectPolicy reconnectPolicy_ = new ReconnectPolicy();
+    private final Runnable reconnect_ = this::reconnect;
+    private volatile boolean reconnectPending_;
+    private String startMode_;
+    private SurfaceView surfaceView_;
+    private InputDevice.OnKeyHolder keyHolder_;
 
     public ODAService() {}
 
@@ -72,8 +81,21 @@ public class ODAService extends Service implements IAndroidAutoEntityEventHandle
     }
 
     public void startUsb(SurfaceView surfaceView, InputDevice.OnKeyHolder keyHolder){
+        startMode_ = MODE_USB;
+        surfaceView_ = surfaceView;
+        keyHolder_ = keyHolder;
+        cancelReconnect();
+        reconnectPolicy_.reset();
+        beginUsb(surfaceView, keyHolder, false);
+    }
+
+    private void beginUsb(SurfaceView surfaceView, InputDevice.OnKeyHolder keyHolder, boolean reconnecting){
         startThread_ = new Thread(() -> {
             Looper.prepare();
+
+            if (reconnecting && !isRunning_) {
+                return; // stopped while the reconnect was starting
+            }
 
             if (usbManager_.aoapDevice() != null) {
                 isRunning_ = true;
@@ -84,6 +106,7 @@ public class ODAService extends Service implements IAndroidAutoEntityEventHandle
                     if (device.open()) {
                         if (Log.isInfo()) Log.i(TAG, "device opened");
                         androidAutoEntity_ = AndroidAutoEntityFactory.create(this, device, surfaceView, keyHolder);
+                        reconnectPolicy_.sessionStarted(SystemClock.elapsedRealtime());
                         androidAutoEntity_.start(this);
                     } else {
                         Log.e(TAG, "Error in open usb device");
@@ -96,6 +119,10 @@ public class ODAService extends Service implements IAndroidAutoEntityEventHandle
 //                    onAndroidAutoQuit();
                     return;
                 }
+            } else if (reconnecting) {
+                if (Log.isInfo()) Log.i(TAG, "reconnect: aoap device not available");
+                onReconnectStartFailed();
+                return;
             }
             if (Log.isInfo()) Log.i(TAG, "start usb thead completed");
         });
@@ -103,8 +130,21 @@ public class ODAService extends Service implements IAndroidAutoEntityEventHandle
     }
 
     public void startWifi(SurfaceView surfaceView, InputDevice.OnKeyHolder keyHolder){
+        startMode_ = MODE_WIFI;
+        surfaceView_ = surfaceView;
+        keyHolder_ = keyHolder;
+        cancelReconnect();
+        reconnectPolicy_.reset();
+        beginWifi(surfaceView, keyHolder, false);
+    }
+
+    private void beginWifi(SurfaceView surfaceView, InputDevice.OnKeyHolder keyHolder, boolean reconnecting){
         startThread_ = new Thread(() -> {
             Looper.prepare();
+
+            if (reconnecting && !isRunning_) {
+                return; // stopped while the reconnect was starting
+            }
 
             try {
                 String ipAddress = wifiManager_.getIpAddress();
@@ -114,19 +154,29 @@ public class ODAService extends Service implements IAndroidAutoEntityEventHandle
 //                    if (Log.isInfo()) Log.i(TAG, "Connect to ip " + ipAddress);
                     TCPEndpoint tcpEndpoint = new TCPEndpoint(ipAddress);
                     androidAutoEntity_ = AndroidAutoEntityFactory.create(this, tcpEndpoint, surfaceView, keyHolder);
+                    reconnectPolicy_.sessionStarted(SystemClock.elapsedRealtime());
                     androidAutoEntity_.start(this);
+                } else if (reconnecting) {
+                    onReconnectStartFailed();
+                    return;
                 }
                 if (Log.isInfo()) Log.i(TAG, "start wifi thead completed");
             } catch (TCPConnectException e){
                 Log.e(TAG, "TCP Connection error", e);
-                stop();
+                if (reconnecting) {
+                    onReconnectStartFailed();
+                } else {
+                    stop();
+                }
             }
         });
         startThread_.start();
     }
 
     public void shutdown(){
-        androidAutoEntity_.shutdown();
+        if (androidAutoEntity_ != null) {
+            androidAutoEntity_.shutdown();
+        }
     }
 
     public void releaseFocus(){
@@ -136,10 +186,14 @@ public class ODAService extends Service implements IAndroidAutoEntityEventHandle
     }
 
     public void gainFocus(){
-        androidAutoEntity_.gainFocus();
+        if (androidAutoEntity_ != null) {
+            androidAutoEntity_.gainFocus();
+        }
     }
 
     public void stop(){
+        cancelReconnect();
+
         if (!isRunning_) {
             if (Log.isInfo()) Log.i(TAG, "service not running, already stopped?");
             return;
@@ -153,6 +207,18 @@ public class ODAService extends Service implements IAndroidAutoEntityEventHandle
             HondaConnectManager.instance().endAudioBinding();
         }
 
+        teardownSession();
+        surfaceView_ = null;
+        keyHolder_ = null;
+
+        Intent stopIntent = new Intent(ODAService.STOP_ACTION);
+        localBroadcastManager_.sendBroadcast(stopIntent);
+
+        Intent service = new Intent(this, ODAService.class);
+        stopService(service);
+    }
+
+    private void teardownSession(){
         if (androidAutoEntity_ != null) {
             androidAutoEntity_.stop();
         }
@@ -163,12 +229,40 @@ public class ODAService extends Service implements IAndroidAutoEntityEventHandle
         }
 
         startThread_ = null;
+    }
 
-        Intent stopIntent = new Intent(ODAService.STOP_ACTION);
-        localBroadcastManager_.sendBroadcast(stopIntent);
+    private void cancelReconnect(){
+        reconnectPending_ = false;
+        mainHandler_.removeCallbacks(reconnect_);
+    }
 
-        Intent service = new Intent(this, ODAService.class);
-        stopService(service);
+    private void scheduleReconnect(long delayMs){
+        reconnectPending_ = true;
+        mainHandler_.postDelayed(reconnect_, delayMs);
+    }
+
+    private void reconnect(){
+        if (!reconnectPending_) {
+            return;
+        }
+        reconnectPending_ = false;
+
+        if (Log.isInfo()) Log.i(TAG, "reconnect attempt " + reconnectPolicy_.attempt());
+        if (MODE_WIFI.equals(startMode_)) {
+            beginWifi(surfaceView_, keyHolder_, true);
+        } else {
+            beginUsb(surfaceView_, keyHolder_, true);
+        }
+    }
+
+    private void onReconnectStartFailed(){
+        long delay = reconnectPolicy_.onStartFailed();
+        if (delay != ReconnectPolicy.GIVE_UP) {
+            scheduleReconnect(delay);
+        } else {
+            mainHandler_.post(() -> Toast.makeText(this, "Could not reconnect", Toast.LENGTH_LONG).show());
+            stop();
+        }
     }
 
     @Override
@@ -207,6 +301,17 @@ public class ODAService extends Service implements IAndroidAutoEntityEventHandle
     @Override
     public void onAndroidAutoQuitOnError(String error, int nativeErrorCode){
         Log.e(TAG, "closing with error " + error + "(" + nativeErrorCode + ")");
+
+        // a transient error mid-session: keep the player open and start a new Session instead
+        long delay = reconnectPolicy_.onError(error, SystemClock.elapsedRealtime());
+        if (isRunning_ && delay != ReconnectPolicy.GIVE_UP) {
+            if (reconnectPolicy_.attempt() == 1) {
+                mainHandler_.post(() -> Toast.makeText(this, "Reconnecting...", Toast.LENGTH_SHORT).show());
+            }
+            teardownSession();
+            scheduleReconnect(delay);
+            return;
+        }
 
         mainHandler_.post(() -> {
             Toast.makeText(this, "Closed due to " + error + " error", Toast.LENGTH_LONG).show();
