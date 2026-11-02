@@ -1,6 +1,7 @@
 package it.smg.hu.projection;
 
 import static org.junit.Assert.assertArrayEquals;
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 import org.junit.Test;
@@ -94,6 +95,72 @@ public class AudioCodecTest {
         assertTrue("not all audio was played", sink.awaitBytes(expected.size(), 5000));
         codec.stop();
         assertArrayEquals(expected.toByteArray(), sink.allBytes());
+    }
+
+    private static ByteBuffer filled(int size, int value) {
+        byte[] bytes = new byte[size];
+        java.util.Arrays.fill(bytes, (byte) value);
+        ByteBuffer b = ByteBuffer.allocateDirect(size);
+        b.put(bytes).flip();
+        return b;
+    }
+
+    @Test
+    public void cappedQueueDropsOldestAudioAndKeepsNewest() throws Exception {
+        FakeAudioSink sink = new FakeAudioSink();
+        AudioCodec codec = new AudioCodec("capped-test-audio", () -> sink, 100, 0);
+
+        for (int i = 1; i <= 10; i++) codec.write(filled(30, i), i); // 300 bytes queued before playback
+        codec.start();
+
+        assertTrue(sink.awaitBytes(90, 2000));
+        codec.stop();
+        byte[] played = sink.allBytes();
+        assertTrue("played " + played.length + " bytes, cap is 100", played.length <= 100);
+        assertEquals("newest packet must be kept", 10, played[played.length - 1]);
+        assertEquals("oldest audio must be dropped", 8, played[0]);
+    }
+
+    @Test
+    public void uncappedQueueKeepsEverything() throws Exception {
+        FakeAudioSink sink = new FakeAudioSink();
+        AudioCodec codec = codecPlayingTo(sink);
+
+        for (int i = 1; i <= 10; i++) codec.write(filled(30, i), i);
+        codec.start();
+
+        assertTrue(sink.awaitBytes(300, 2000));
+        codec.stop();
+        assertEquals(1, sink.allBytes()[0]);
+    }
+
+    @Test
+    public void playbackWaitsForPrebufferBeforeStartingTheSink() throws Exception {
+        FakeAudioSink sink = new FakeAudioSink();
+        AudioCodec codec = new AudioCodec("prebuffer-test-audio", () -> sink, 0, 100);
+        codec.start();
+
+        codec.write(filled(40, 1), 0);
+        Thread.sleep(100);
+        assertEquals("sink started before enough audio was buffered", 0, sink.played.get());
+        assertEquals(0, sink.writeCount());
+
+        codec.write(filled(60, 2), 0);
+        assertTrue(sink.awaitBytes(100, 2000));
+        assertEquals(1, sink.played.get());
+        codec.stop();
+    }
+
+    @Test
+    public void stopWhileWaitingForPrebufferReturnsPromptly() throws Exception {
+        FakeAudioSink sink = new FakeAudioSink();
+        AudioCodec codec = new AudioCodec("prebuffer-stop-test-audio", () -> sink, 0, 100);
+        codec.start();
+
+        long t0 = System.nanoTime();
+        codec.stop();
+        assertTrue((System.nanoTime() - t0) / 1_000_000 < 500);
+        assertEquals(1, sink.released.get());
     }
 
     @Test

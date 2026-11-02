@@ -17,6 +17,9 @@ public abstract class AudioOutput extends it.smg.libs.aasdk.projection.AudioOutp
     protected int audioCodecStreamType_;
     protected HondaConnectManager hondaConnectManager_;
 
+    /** Total playback delay in ms for a bounded, larger buffer; 0 keeps the legacy small buffer. */
+    protected int playbackDelayMs_ = 0;
+
     private IAudioCodec audioCodec_;
 
     public AudioOutput(){
@@ -32,7 +35,7 @@ public abstract class AudioOutput extends it.smg.libs.aasdk.projection.AudioOutp
     @Override
     public boolean open() {
         if (Log.isInfo()) Log.i(tag(), "Create Android Audio codec");
-        audioCodec_ = new AudioCodec(tag(), audioCodecStreamType_, getSampleRate(), getChannelCount(), getSampleSize());
+        audioCodec_ = new AudioCodec(tag(), audioCodecStreamType_, getSampleRate(), getChannelCount(), getSampleSize(), playbackDelayMs_);
         return true;
     }
 

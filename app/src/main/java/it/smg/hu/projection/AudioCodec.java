@@ -10,6 +10,7 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import it.smg.libs.common.Log;
 
@@ -17,6 +18,11 @@ public class AudioCodec implements IAudioCodec, Runnable {
     private static final String TAG = "AudioCodec";
     private static final long IDLE_POLL_MS = 50;
     private static final int PACKET_POOL_SIZE = 64;
+    private static final long PREBUFFER_POLL_MS = 5;
+    // how a bounded total delay is split: sink buffer + queue cap, with the prebuffer inside the queue part
+    private static final int SINK_PERCENT = 60;
+    private static final int QUEUE_PERCENT = 40;
+    private static final int PREBUFFER_PERCENT = 15;
 
     /** A reusable audio packet; data may be longer than length. */
     private static final class Packet {
@@ -37,27 +43,57 @@ public class AudioCodec implements IAudioCodec, Runnable {
     private AudioSink audioSink_;
     protected AtomicBoolean running_;
 
+    private final int maxQueuedBytes_; // 0 = unbounded
+    private final int prebufferBytes_; // 0 = start playing immediately
+    private final AtomicInteger queuedBytes_ = new AtomicInteger();
+
     private final BlockingQueue<Packet> queue_;
     private final BlockingQueue<Packet> pool_;
     private Thread codecThread_;
 
+    /** Legacy latency: small sink buffer, unbounded queue, immediate start. */
     public AudioCodec(String name, int streamType, int sampleRate, int channelConfig, int sampleSize){
+        this(name, streamType, sampleRate, channelConfig, sampleSize, 0);
+    }
+
+    /**
+     * @param totalDelayMs if > 0, sink buffer plus queue cap add up to about this delay and playback
+     *                     starts once a small amount is buffered; if 0, today's latency is kept
+     */
+    public AudioCodec(String name, int streamType, int sampleRate, int channelConfig, int sampleSize, int totalDelayMs){
         this(name, () -> {
             int channels = channels2num(channelConfig);
             int format = sampleSizeFromInt(sampleSize);
             int bufferSize = AudioTrack.getMinBufferSize(sampleRate, channels, format);
-            if (Log.isInfo()) Log.i(TAG, "Buffer size " + bufferSize + "*2");
-            return new AndroidAudioSink(streamType, sampleRate, channels, format, bufferSize * 3);
-        });
+            if (totalDelayMs > 0) {
+                bufferSize = Math.max(bufferSize, bytesFor(sampleRate, channelConfig, sampleSize, totalDelayMs * SINK_PERCENT / 100));
+            } else {
+                bufferSize *= 3;
+            }
+            if (Log.isInfo()) Log.i(TAG, "Buffer size " + bufferSize);
+            return new AndroidAudioSink(streamType, sampleRate, channels, format, bufferSize);
+        },
+        totalDelayMs > 0 ? bytesFor(sampleRate, channelConfig, sampleSize, totalDelayMs * QUEUE_PERCENT / 100) : 0,
+        totalDelayMs > 0 ? bytesFor(sampleRate, channelConfig, sampleSize, totalDelayMs * PREBUFFER_PERCENT / 100) : 0);
     }
 
     AudioCodec(String name, AudioSink.Factory sinkFactory){
+        this(name, sinkFactory, 0, 0);
+    }
+
+    AudioCodec(String name, AudioSink.Factory sinkFactory, int maxQueuedBytes, int prebufferBytes){
         name_ = name;
         sinkFactory_ = sinkFactory;
+        maxQueuedBytes_ = maxQueuedBytes;
+        prebufferBytes_ = prebufferBytes;
         running_ = new AtomicBoolean(false);
 
         queue_ = new LinkedBlockingQueue<>();
         pool_ = new ArrayBlockingQueue<>(PACKET_POOL_SIZE);
+    }
+
+    private static int bytesFor(int sampleRate, int channelCount, int sampleSize, int ms){
+        return (int) ((long) sampleRate * channelCount * (sampleSize / 8) * ms / 1000);
     }
 
     private static int channels2num(int channels){
@@ -97,7 +133,18 @@ public class AudioCodec implements IAudioCodec, Runnable {
         }
         packet.fill(buffer);
 
+        queuedBytes_.addAndGet(packet.length);
         queue_.add(packet);
+
+        if (maxQueuedBytes_ > 0) {
+            // drop the oldest audio so the newest is kept and the delay stays bounded
+            while (queuedBytes_.get() > maxQueuedBytes_) {
+                Packet oldest = queue_.poll();
+                if (oldest == null) break;
+                queuedBytes_.addAndGet(-oldest.length);
+                pool_.offer(oldest);
+            }
+        }
     }
 
     @Override
@@ -127,6 +174,7 @@ public class AudioCodec implements IAudioCodec, Runnable {
             }
 
             queue_.clear();
+            queuedBytes_.set(0);
             if (Log.isDebug()) Log.d(TAG, "queue empty");
         }
     }
@@ -150,6 +198,15 @@ public class AudioCodec implements IAudioCodec, Runnable {
             if (Log.isInfo()) Log.i(TAG, "initialized");
         }
 
+        // avoid an initial underrun: wait until a little audio is buffered before playing
+        while (running_.get() && queuedBytes_.get() < prebufferBytes_) {
+            try {
+                Thread.sleep(PREBUFFER_POLL_MS);
+            } catch (InterruptedException e) {
+                break;
+            }
+        }
+
         if (Log.isInfo()) Log.i(TAG, "starting audiotrack");
         audioSink_.play();
 
@@ -163,6 +220,7 @@ public class AudioCodec implements IAudioCodec, Runnable {
                 break;
             }
             if (packet != null){
+                queuedBytes_.addAndGet(-packet.length);
                 audioSink_.write(packet.data, 0, packet.length);
                 pool_.offer(packet);
             }

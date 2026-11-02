@@ -6,6 +6,7 @@ import it.smg.libs.common.Log;
 public class MediaAudioOutput extends AudioOutput {
 
     private static final String TAG = "MediaAudioOutput";
+    private static final int MEDIA_PLAYBACK_DELAY_MS = 250;
 
     public MediaAudioOutput(){
         super();
@@ -13,6 +14,7 @@ public class MediaAudioOutput extends AudioOutput {
         channelConfig_ = settings_.audio.mediaChannelCount();
         sampleSize_ = settings_.audio.mediaSampleSize();
         sampleRate_ = settings_.audio.mediaSampleRate();
+        playbackDelayMs_ = MEDIA_PLAYBACK_DELAY_MS;
 
         if (settings_.advanced.hondaIntegrationEnabled()){
             audioCodecStreamType_ = hondaConnectManager_.mediaAudioStream(ChannelId.MEDIA_AUDIO);
